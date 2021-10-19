@@ -1,0 +1,203 @@
+**************************************************************************************
+General documentation on Architecture and Basic level of IaC - Infrastructure As Code
+**************************************************************************************
+1. This document contains the aspects considered for architecture and explaination of the same.
+2. The different kind of IaC scripts largely with ansible as the base and one kustomize script using groovy.
+
+-----------SERVICES:---------
+1. Front end (nginx web server to act as reverse proxy as well)
+2. Data processing - data streaming, data flow charts - to process the data between front end and backend
+3. DB - Dynamo DB - (if required)
+4. The cert used inside the system - internal communication inside the service mesh - http not https. Service mesh will do all the heavy lifting.
+
+
+-----------KEY Management:------
+
+1. Always prefer for customer managed encryption keys.
+2. Based on the data classification the storage will be encripted.
+3. Storage can be DB (supported by Azure)
+4. Why not default encryption provided for cloud management?
+
+
+-----------Common:--------------
+1. We'll send reports when and where required. chef-inspec - monitoring for infra.
+2. Protection layer - guardrails - 
+3. Networking by default enabled - security clearance -Anything (changes) in Network happens thru' Security Umbrella (To open the FW, to clear a DNS)
+4. Process - Platform will decide on services
+5. System implementation - based on end user requirement.
+6. API GATEWAY (as AWS supports) - can be placed between L4 and L7, or any where beneath L7. Else it should be placed before L4.
+
+
+----------Using Jenkins pipeline with Groovy script to complete customized deployment:---------
+# If in case we are deploying it to cluster we can use kustomize app to achieve it.
+pipeline {
+    agent { label 'maven3.6' }
+    parameters {
+        choice(name: 'TARGET_PROJECT', choices: ['hari-nep-review-test','hari-nep-review-preprod','hari-nep-review-prod'], description: 'Target project to install server for')
+        string(name: 'KUSTOMIZE_BRANCH', defaultValue: "test", description: 'Branch with kustomize setup')
+    }
+    options {
+        timeout(time: 1, unit: 'HOURS')
+    }
+    stages {
+        stage('Initialize build environment') {
+            steps {
+                script {
+                    def nexuscreds = ""
+                    withCredentials([string(credentialsId: "HariJenkinsCredentialsID", variable: 'nexus_credentialsId')]) {
+                        def nexus_credentialsIdSSH = "${nexus_credentialsId}SSH"
+
+                        echo "nexus_credentialsIdSSH is ${nexus_credentialsIdSSH}"
+
+                        checkout([$class                           : 'GitSCM',
+                                branches                         : [[name: env.KUSTOMIZE_BRANCH]],
+                                doGenerateSubmoduleConfigurations: false,
+                                extensions                       : [],
+                                submoduleCfg                     : [],
+                                userRemoteConfigs                : [[credentialsId: nexus_credentialsIdSSH, url: 'ssh://git@bitbucket_hari/kustomize-app.git']]])
+								 withCredentials([usernamePassword(credentialsId: nexus_credentialsId, passwordVariable: 'NEXUS_PASS', usernameVariable: 'NEXUS_USER')]) {
+                            sh """
+                                mkdir bin
+                                curl -k -u $NEXUS_USER:$NEXUS_PASS -o bin/kustomize https://sample_repo
+                                curl -k -u $NEXUS_USER:$NEXUS_PASS -O https://sample_repo
+                                chmod 755 bin/kustomize
+                                tar xf openssl-1.1.1g-C bin
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Unpack secrets if applicable') {
+            steps {
+                script {
+                    sh "oc project ${params.TARGET_PROJECT}"
+                    read_secret_info()
+                   
+                }
+            }
+        }
+
+        stage('Apply kustomize') {
+            steps {
+                script {
+                    sh """
+                        export PATH=`pwd`/bin:\$PATH
+                        overlays/${params.TARGET_PROJECT}/apply.sh
+                        oc get dc -n ${params.TARGET_PROJECT} | grep -v NAME | cut -d" " -f 1 | xargs -n1 oc rollout latest -n ${params.TARGET_PROJECT} || true
+                    """
+                }
+            }
+        }
+    }
+}
+
+def read_secret_info() {
+    def overlayKey = sh ( script: /oc get secret secret --export -o yaml | grep "^  Secrets info= /{"$params.TARGET_PROJECT":"$overlayKey"}/
+}
+
+
+
+
+
+---------Creating a web service instance----------
+
+##The AWS auto scaling using auto scaling group and elastic load balancer will use an AWS IAM service-linked role to manage predictive scaling of EC2 auto scaling groups.
+## --image-id resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2 
+
+- name: Create a web server instance
+  hosts: localhost
+  gather_facts: False
+  vars:
+    keypair: my_keys
+    instance_type: m5.xlarge
+    security_group: nep_securitygroup
+    image: hari_ami_image
+    region: us-east-1
+  tasks:
+    - name: Launch instance
+      amazon.aws.ec2:
+         key_name: "{{ keypair }}"
+         group: "{{ security_group }}"
+         instance_type: "{{ instance_type }}"
+         image: "{{ image }}"
+         wait: true
+         region: "{{ region }}"
+         vpc_subnet_id: subnet-29e63245
+         assign_public_ip: yes
+      register: ec2
+
+    - name: Add new instance to host group
+      add_host:
+        hostname: "{{ item.public_ip }}"
+        groupname: launched
+      loop: "{{ ec2.instances }}"
+
+    - name: Wait for SSH to come up
+      delegate_to: "{{ item.public_dns_name }}"
+      wait_for_connection:
+        delay: 60
+        timeout: 320
+      loop: "{{ ec2.instances }}"
+	  
+	  
+-----------Creating a nginx instance using ansible:--------
+## We have to make sure to use a key that we had created to access the server and set up the security group so that we can have port 22 (ssh) and 80 (http) open.
+## Copy the nginx-repo.key and nginx-repo.crt files provided by NGINX, Inc. to ~/.ssh/ngx-certs/
+
+	# Run with ansible-playbook path_to_my_playbook/nginx_install.yml
+- hosts: 
+  become: yes
+  tasks:
+    - name: Installs Nginx web server
+      apt: pkg=nginx state=installed update_cache=true
+      notify:
+        - start nginx
+
+    - name: Upload default index.html for host
+      copy: src=~/Documents/index.html dest=/usr/share/nginx/html/ mode=0644
+
+    - name: Upload first CSS file
+      copy: src=~/Documents/style.css dest=/usr/share/nginx/html/ mode=0644
+
+    - name: Add a line in /etc/nginx/sites-available/default
+      lineinfile: dest=/etc/nginx/sites-available/default
+                  regexp='# Only for nginx-Hari'
+                  line='location /images {}'       
+    
+    - name: Create a directory called images
+      file: path=/usr/share/nginx/html/images state=directory mode=0755
+
+    - name: Upload first image
+      copy: src=~/Pictures/pic.jpeg dest=/usr/share/nginx/html/images/ mode=0644
+
+
+  handlers:
+    - name: start Nginx
+      service: name=nginx state=started
+	  
+	  
+****verification*****
+1. Add the oublic IP of the remote server in the hosts file.
+2. it should be possible to ping the remote host by executing "ansible all -m ping" command.
+3. If everything does well, it should be accessible through http://public_hostname_of_EC2_Instance/images/pic.jpeg
+
+
+
+-------------Creating an ansible AWS autoscale group:--------------
+
+# Basic configuration with Launch info
+
+- community.aws.ec2_asg:
+    name: nep_special
+    load_balancers: [ 'lb1', 'lb2' ]
+    availability_zones: [ 'eu-west-1', 'eu-west-2' ]
+    launch_config_name: 'lc-1'
+    min_size: 1
+    max_size: 10
+    desired_capacity: 5
+    vpc_zone_identifier: [ 'subnet-abcd1234', 'subnet-efgh5678' ]
+    tags:
+      - environment: test
+        propagate_at_launch: no
